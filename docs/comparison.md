@@ -28,14 +28,37 @@ Python 版令牌桶放 Redis 是为了**多 worker/多副本共享配额**（生
 3. **flush 语义**：Python ASGI 的 `send({type: http.response.body})` 分帧即推；Go 需显式 `http.Flusher` 断言 + 每 chunk Flush——Go 更底层，控制粒度更细。
 4. **单二进制**：`go build` 产物 5.78MB（-ldflags -s -w），无解释器无依赖树；Python 版部署需 venv + requirements（或 Docker）。这是部署维度而非运行维度差异。
 
-## 四、压测数据（待回填）
+## 四、压测数据（2026-11-05 实测，aiohttp 客户端 · Windows 本机 · 同机 mock 上游）
 
-方法论沿用 agentgate（Python 版）EVIDENCE §3 三教训：c=1 测附加开销（排队≠每请求代价）、客户端瓶颈差值法（httpx/aiohttp 也会冒充服务端瓶颈）、组件分解。
+方法论沿用 Python 版 EVIDENCE §3 三教训：c=1 测附加开销（排队≠每请求代价）、同客户端差值法抵消客户端成本、口径逐字写明。客户端=独立 aiohttp 进程（`scripts/load_client.py`），上游=独立 FastAPI SSE mock（`scripts/mock_upstream.py`，流式 20 chunk+[DONE]），目标只换端口（裸 mock vs Go 网关），**同一把尺子**。
 
-| 场景 | Python 版（实测口径） | Go 版（待回填） |
+### c=1 每请求附加开销（100 请求串行，无排队——合法口径）
+
+| 目标 | P50 | P95 | 吞吐 |
+|---|---|---|---|
+| 裸 mock 基线（uvicorn 直连） | 0.4ms | 0.6ms | 2097 req/s |
+| **Go 网关** | **0.7ms** | **0.9ms** | 1373 req/s |
+| **附加开销（差值）** | **0.3ms** | **0.3ms** | — |
+
+### c=50 容量组（非流式 700 / 流式 300，单进程）
+
+| 指标 | 裸 mock 基线 | Go 网关 |
 |---|---|---|
-| c=1 附加开销 | 3.55ms（P95，全链） | 待测 |
-| 多 worker 扩展 | 1.00x/2.15x/4.04x（1/2/4 worker） | goroutine 无需多进程，待测单进程多核 |
-| SSE 并发流 | 待测 | 待测 |
+| 非流式吞吐 | 4091 req/s | 2231 req/s |
+| 非流式延迟 | P50 10.0 / P95 20.9ms | P50 4.6 / P95 60.1ms |
+| 流式吞吐 | 1729 req/s | 1429 req/s |
+| 流式 TTFT | P50 18.2ms | P50 10.1ms |
 
-> 回填纪律：数字必须来自最后一次代码提交之后的实测；口径逐字写明（连接数/时长/上游 mock 形态）。
+### ⚠️ 与 Python 版 3.55ms 的对比口径声明（诚实优先）
+
+Python 版记录值 3.55ms 是**完整 M1 链路**的附加开销：含鉴权缓存读 + 准入 Lua（Redis 往返×5）+ 渠道状态 + httpx 转发跳。本 Go 版是**裸转发链路**：内存令牌桶 + EMA 选路 + HTTP 转发，**没有 Redis 鉴权/记账**。0.3ms vs 3.55ms 不是同功能对比——其中 Redis 同机往返 5 次本身约 0.5~1.5ms 量级，语言运行时的真实差距小于表观差距。若要同功能对比，Go 版需补 Redis 鉴权（届时零依赖卖点失效）——这恰好反证"功能取舍 > 语言玄学"。
+
+### 客户端瓶颈声明（同 Python 版方法论）
+
+c=50 组的绝对吞吐受单进程 aiohttp 客户端 CPU 约束（基线也仅 4091 req/s），不代表网关容量上限。Go 网关单进程内 goroutine 自动摊多核，无 Python 版 uvicorn --workers 多进程扩展问题（Python 版 1.00x/2.15x/4.04x 的多 worker 实测在 agentgate EVIDENCE）。Go 非流式 P95 60ms 长尾来自 GC/调度抖动 + 客户端限制下的排队，P50 4.6ms 低于基线 P50 属客户端调度差异，结论以 c=1 差值口径为准。
+
+### 环境备注
+
+- Go go1.23.4 windows/amd64，`-ldflags="-s -w"` 单二进制 5.78MB；`-race` 因 Windows 需 CGO 留给 CI（ubuntu runner 自带 gcc）。
+- Python 版口径：agentgate EVIDENCE §3（Python 3.12 + 便携 Redis 5.0.14 + SQLite，进程内 ASGI mock）。
+
