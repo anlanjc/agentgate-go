@@ -1,0 +1,22 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest   # runner 自带 gcc：本地 Windows 无 CGO，-race 在这里跑
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      - name: vet
+        run: go vet ./...
+      - name: fmt（gofmt 零漂移）
+        run: test -z "$(gofmt -l .)"
+      - name: test（含 -race 并发安全证明）
+        run: go test -race -count=1 -v ./...
+      - name: build（单二进制产物）
+        run: go build -ldflags="-s -w" -o agentgate-go .
