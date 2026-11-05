@@ -75,10 +75,13 @@ type Result struct {
 // Admitter 复用 go-redis 的脚本缓存：NewScript 首发 EVAL，成功后走 EVALSHA，
 // 收到 NOSCRIPT 自动回退重放——与 Python 版 eval_cached 同一款省往返思路。
 type Admitter struct {
+	rdb    *redis.Client
 	script *redis.Script
 }
 
-func New() *Admitter { return &Admitter{script: redis.NewScript(admitLua)} }
+func New(rdb *redis.Client) *Admitter {
+	return &Admitter{rdb: rdb, script: redis.NewScript(admitLua)}
+}
 
 func bucketKey(keyID string) string { return "rl:rpm:" + keyID }
 func tpmKey(keyID string) string    { return "tpm:" + keyID }
@@ -88,13 +91,13 @@ func budgetKey(keyID string) string { return "budget:" + keyID }
 // capacity<=0 → 直接拒绝（Python 版同款：60s 后重试的兜底口径，防御限速配置为 0）。
 // Redis 故障原样上抛，调用方（main.go）按 fail-closed 503 处理——准入承载计费硬
 // 上界，跳过意味着限流与预算全部失效，宁可拒绝也不裸放（Python 版同语义）。
-func (a *Admitter) Admit(ctx context.Context, rdb *redis.Client, keyID string, capacity, amount int) (*Result, error) {
+func (a *Admitter) Admit(ctx context.Context, keyID string, capacity, amount int) (*Result, error) {
 	if capacity <= 0 {
 		return &Result{Allowed: false, RetryAfterMs: 60000}, nil
 	}
 	rate := float64(capacity) / 60.0 // Python 版同款：60s 补满
 	nowMs := time.Now().UnixMilli()
-	res, err := a.script.Run(ctx, rdb, []string{
+	res, err := a.script.Run(ctx, a.rdb, []string{
 		bucketKey(keyID), tpmKey(keyID), budgetKey(keyID),
 	}, capacity, rate, nowMs, amount).Slice()
 	if err != nil {
